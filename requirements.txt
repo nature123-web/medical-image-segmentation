@@ -1,0 +1,12 @@
+torch>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# Optional: reading real medical formats (NIfTI, DICOM)
+# nibabel>=5.1.0
+# pydicom>=2.4.0
+
+# Dev
+pytest>=7.4.0

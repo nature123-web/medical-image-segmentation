@@ -1,0 +1,49 @@
+seed: 42
+out_dir: runs/base
+
+data:
+  size: 128
+  n_train: 1200
+  n_val: 200
+  n_test: 300
+  # Not 1.0 on purpose: a model never shown a negative case learns to always
+  # find something, which is the failure mode of most lesion detectors.
+  lesion_probability: 0.75
+  min_lesion_fraction: 0.003    # 0.3% of the image
+  max_lesion_fraction: 0.03
+  contrast: 0.35                # lesion vs surrounding tissue; low on purpose
+  noise_level: 0.12
+  augment: true
+
+model:
+  in_channels: 1
+  n_classes: 1
+  base_channels: 32
+  depth: 4
+  dropout: 0.0
+  norm: instance                # instance | batch | group | none
+  bilinear: true                # avoids transposed-conv checkerboarding
+  deep_supervision: false
+
+loss:
+  dice_weight: 1.0
+  bce_weight: 1.0
+  focal_weight: 0.0
+  tversky_weight: 0.0
+  tversky_alpha: 0.3            # false-positive weight
+  tversky_beta: 0.7             # false-negative weight; raise to buy recall
+  pos_weight: null
+
+postprocess:
+  min_component: 20             # drop connected components below this size
+
+train:
+  epochs: 40
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 0.00001
+  warmup_steps: 100
+  grad_clip: 1.0
+  early_stopping_patience: 10
+  num_workers: 0
+  device: auto
