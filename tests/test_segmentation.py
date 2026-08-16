@@ -427,6 +427,162 @@ def test_patch_memory_estimate_grows_with_patch_size():
 
 
 # --------------------------------------------------------------------------- #
+# Uncertainty
+# --------------------------------------------------------------------------- #
+
+def test_enable_dropout_leaves_normalisation_in_eval():
+    """model.train() would also reactivate BatchNorm's batch statistics.
+
+    That is the standard mistake: predictions would then depend on whatever
+    else happened to share the batch, and the running estimates would drift.
+    """
+    from src.uncertainty import enable_dropout
+
+    model = make_model(dropout=0.2, norm="batch").eval()
+    n_dropout = enable_dropout(model)
+
+    assert n_dropout > 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout2d):
+            assert module.training
+        if isinstance(module, torch.nn.BatchNorm2d):
+            assert not module.training
+
+
+def test_has_active_dropout_detects_zero_probability():
+    from src.uncertainty import has_active_dropout
+
+    assert has_active_dropout(make_model(dropout=0.3))
+    assert not has_active_dropout(make_model(dropout=0.0))
+
+
+def test_binary_entropy_is_maximal_at_one_half():
+    from src.uncertainty import binary_entropy
+
+    assert binary_entropy(torch.tensor(0.5)).item() == pytest.approx(
+        float(np.log(2)), abs=1e-5
+    )
+    assert binary_entropy(torch.tensor(0.5)) > binary_entropy(torch.tensor(0.9))
+    assert binary_entropy(torch.tensor(0.5)) > binary_entropy(torch.tensor(0.1))
+
+
+def test_binary_entropy_is_near_zero_when_confident():
+    from src.uncertainty import binary_entropy
+
+    assert binary_entropy(torch.tensor(0.9999)).item() < 0.01
+    assert binary_entropy(torch.tensor(0.0001)).item() < 0.01
+
+
+def test_binary_entropy_is_finite_at_the_extremes():
+    """Unclamped, log(0) would make the whole uncertainty map NaN."""
+    from src.uncertainty import binary_entropy
+
+    values = binary_entropy(torch.tensor([0.0, 1.0]))
+    assert torch.isfinite(values).all()
+
+
+def test_mc_dropout_is_stochastic_when_dropout_is_active():
+    from src.uncertainty import mc_dropout_predict
+
+    torch.manual_seed(0)
+    model = make_model(dropout=0.3).eval()
+    out = mc_dropout_predict(model, torch.randn(1, 1, 32, 32), n_samples=8)
+
+    assert out["mean"].shape == (1, 1, 32, 32)
+    assert out["samples"].shape[0] == 8
+    assert out["std"].max() > 0, "samples were identical despite dropout"
+
+
+def test_mc_dropout_is_deterministic_without_dropout(capsys):
+    from src.uncertainty import mc_dropout_predict
+
+    model = make_model(dropout=0.0).eval()
+    out = mc_dropout_predict(model, torch.randn(1, 1, 32, 32), n_samples=5)
+
+    assert out["std"].max() < 1e-6
+    # And it must say so, rather than silently returning a zero map.
+    assert "no active dropout" in capsys.readouterr().out
+
+
+def test_uncertainty_decomposition_is_consistent():
+    """total = aleatoric + epistemic, and none of them is negative."""
+    from src.uncertainty import mc_dropout_predict
+
+    torch.manual_seed(0)
+    model = make_model(dropout=0.3).eval()
+    out = mc_dropout_predict(model, torch.randn(2, 1, 32, 32), n_samples=12)
+
+    assert torch.allclose(out["total"], out["aleatoric"] + out["epistemic"],
+                          atol=1e-5)
+    for key in ("total", "aleatoric", "epistemic"):
+        assert (out[key] >= 0).all(), f"{key} went negative"
+        assert torch.isfinite(out[key]).all()
+
+
+def test_epistemic_uncertainty_is_zero_without_dropout():
+    """With no weight posterior there is no model uncertainty, only noise."""
+    from src.uncertainty import mc_dropout_predict
+
+    model = make_model(dropout=0.0).eval()
+    out = mc_dropout_predict(model, torch.randn(1, 1, 32, 32), n_samples=6,
+                             warn_if_deterministic=False)
+    assert out["epistemic"].max() < 1e-5
+
+
+def test_mc_dropout_restores_the_original_mode():
+    from src.uncertainty import mc_dropout_predict
+
+    model = make_model(dropout=0.2)
+    model.eval()
+    mc_dropout_predict(model, torch.randn(1, 1, 32, 32), n_samples=3,
+                       warn_if_deterministic=False)
+    assert not model.training
+
+
+def test_case_uncertainty_restricts_to_the_mask():
+    """A whole-image mean is swamped by confidently-background pixels."""
+    from src.uncertainty import case_uncertainty
+
+    uncertainty = torch.zeros(1, 1, 32, 32)
+    uncertainty[:, :, 8:12, 8:12] = 1.0          # uncertain only in the lesion
+    mask = torch.zeros(1, 1, 32, 32)
+    mask[:, :, 8:12, 8:12] = 1.0
+
+    whole_image = case_uncertainty(uncertainty, None)
+    within_mask = case_uncertainty(uncertainty, mask)
+    assert within_mask == pytest.approx(1.0)
+    assert whole_image < 0.05
+
+
+def test_case_uncertainty_falls_back_when_the_mask_is_empty():
+    from src.uncertainty import case_uncertainty
+
+    uncertainty = torch.full((1, 1, 8, 8), 0.4)
+    assert case_uncertainty(uncertainty, torch.zeros(1, 1, 8, 8)) == \
+        pytest.approx(0.4)
+
+
+def test_rank_cases_for_review_picks_the_most_uncertain():
+    from src.uncertainty import rank_cases_for_review
+
+    uncertainties = np.array([0.1, 0.9, 0.3, 0.8, 0.2])
+    picked = rank_cases_for_review(uncertainties, budget=0.4)
+    assert set(picked.tolist()) == {1, 3}
+
+
+def test_uncertainty_error_correlation_is_positive_when_useful():
+    """Uncertainty has to predict error, or routing review by it is pointless."""
+    from src.uncertainty import uncertainty_error_correlation
+
+    uncertainties = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    dice = np.array([0.95, 0.9, 0.8, 0.6, 0.4, 0.2])       # error tracks it
+    assert uncertainty_error_correlation(uncertainties, dice) > 0.9
+
+    unrelated = np.array([0.7, 0.7, 0.7, 0.7, 0.7, 0.7])
+    assert np.isnan(uncertainty_error_correlation(unrelated, dice))
+
+
+# --------------------------------------------------------------------------- #
 # Losses
 # --------------------------------------------------------------------------- #
 
