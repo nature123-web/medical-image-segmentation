@@ -1,5 +1,7 @@
 # Medical Image Segmentation with U-Net
 
+[![tests](https://github.com/nature123-web/medical-image-segmentation/actions/workflows/tests.yml/badge.svg)](https://github.com/nature123-web/medical-image-segmentation/actions/workflows/tests.yml)
+
 Lesion segmentation with a U-Net built from scratch, focused on the thing that
 actually decides whether a medical segmentation model works: **extreme class
 imbalance**, and the losses and metrics that survive it.
@@ -35,6 +37,7 @@ note: predicting all-background would score 98.72% pixel accuracy
 | **BCE** | per-pixel calibration; stabilises Dice's gradient when the prediction is nearly empty |
 | **Focal** | down-weights the vast majority of easy background pixels |
 | **Tversky** | independent false-positive/false-negative weights — raise `beta` to buy recall |
+| **Boundary** | distance-weighted surface loss — the only one that knows *how far* a wrong pixel is from the truth |
 
 The default is Dice + BCE, and that combination is standard because each covers
 the other's failure mode: Dice alone has unstable gradients on a near-empty
@@ -53,6 +56,45 @@ per sample:         0.51   ← the truth
 `TverskyLoss(alpha=0.3, beta=0.7)` is available for screening applications where
 a missed lesion costs far more than a false positive a radiologist dismisses in
 two seconds.
+
+### The boundary loss covers a real blind spot
+
+Dice and cross-entropy are *regional*: they count pixels. A false positive
+touching the lesion and one on the opposite side of the image cost exactly the
+same — even though only the second is clinically alarming. That is precisely the
+gap HD95 measures, and until now this repo reported it without optimising it.
+
+`BoundaryLoss` integrates the prediction against the ground truth's **signed
+distance field**, so error is weighted by distance. Enable with
+`loss.boundary_weight`. Two details that matter:
+
+- It is **ramped in** over `boundary_warmup_epochs`. At full strength from step 0
+  the distance term dominates while the prediction is still far from the truth,
+  and training destabilises before Dice has found the lesion at all.
+- It is used **alongside** Dice, never alone — on its own the empty prediction
+  is a valid minimiser, since it has no notion of overlap.
+
+Distances are normalised by the image diagonal so `boundary_weight` means the
+same thing at 128×128 and 512×512.
+
+## Attention gates
+
+`model.attention: true` switches on additive attention gates (Oktay et al.,
+2018). The plain U-Net concatenates the entire encoder feature map into the
+decoder, background included — and when the foreground is under 1% of the image,
+that is overwhelmingly irrelevant signal the decoder must learn to ignore.
+
+The gate computes a spatial attention map from the *coarser* decoder features,
+which already know roughly where the object is, and multiplies the skip by it
+before concatenation. Regions the decoder has no interest in are suppressed at
+source.
+
+The maps are inspectable, which is worth as much as the accuracy:
+
+```python
+logits, attention_maps = model(images, return_attention=True)
+# one (B, 1, H, W) map per decoder level, coarsest first
+```
 
 ## Metrics
 
@@ -97,6 +139,20 @@ below 0.5. The run tunes it on validation and reports both.
 specks can have good Dice and be unusable — every speck is an alert someone must
 dismiss. Connected-component filtering is applied and the effect reported
 separately, so you can see what it bought.
+
+Every run prints all three stages. From an actual (deliberately small) run:
+
+```
+U-Net                              dice 0.4805   hd95 10.9139
+U-Net + flip TTA                   dice 0.5936   hd95  5.4003
+U-Net + TTA + components >= 20px   dice 0.5811   hd95  4.7006
+```
+
+Note the last row: component filtering **lowers Dice** (0.594 → 0.581) while
+improving the boundary metric (5.40 → 4.70). It removes small true-positive
+fragments along with the specks. Whether that trade is worth taking depends on
+whether you are optimising a leaderboard or a radiologist's attention, which is
+exactly why all three are reported rather than only the best one.
 
 **TTA** averages the four dihedral flips. Unlike natural images these are
 label-preserving for most modalities. The inverse flip is applied to each output
