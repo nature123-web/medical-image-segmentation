@@ -34,9 +34,24 @@ def load_model(checkpoint: str | Path, device: torch.device):
 @torch.no_grad()
 def segment(model, images: torch.Tensor, device: torch.device,
             threshold: float = 0.5, tta: bool = True,
-            min_component: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    """Return (probabilities, binary masks) as numpy arrays."""
-    probabilities = model.predict_proba(images.to(device), tta=tta)
+            min_component: int = 0, patch_size: tuple[int, int] | None = None,
+            overlap: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
+    """Return (probabilities, binary masks) as numpy arrays.
+
+    When ``patch_size`` is given, inference runs as a Gaussian-weighted sliding
+    window. That is the only workable route for images larger than the training
+    crop, since memory is quadratic in the side length and the network has never
+    seen a wider field of view than it was trained on.
+    """
+    images = images.to(device)
+    if patch_size is not None:
+        from .inference import sliding_window_inference
+
+        probabilities = sliding_window_inference(
+            images, model, patch_size=patch_size, overlap=overlap,
+        )
+    else:
+        probabilities = model.predict_proba(images, tta=tta)
     probabilities = probabilities.cpu().numpy()[:, 0]
     masks = (probabilities >= threshold).astype(np.float32)
     if min_component > 0:
@@ -89,13 +104,22 @@ def main() -> None:
     parser.add_argument("--n-examples", type=int, default=6)
     parser.add_argument("--no-tta", action="store_true")
     parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--patch-size", type=int, default=None,
+                        help="Run sliding-window inference with this patch "
+                             "size. Required for images larger than the "
+                             "training crop.")
+    parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
     device = torch.device(args.device)
     model, cfg, tuned_threshold = load_model(args.checkpoint, device)
     threshold = args.threshold if args.threshold is not None else tuned_threshold
-    print(f"threshold: {threshold:.2f}  TTA: {not args.no_tta}")
+    patch_size = ((args.patch_size, args.patch_size)
+                  if args.patch_size else None)
+    print(f"threshold: {threshold:.2f}  TTA: {not args.no_tta}"
+          + (f"  sliding window: {args.patch_size}px @ {args.overlap:.0%} overlap"
+             if patch_size else ""))
 
     _, _, test_ds = build_datasets(cfg)
     loader = torch.utils.data.DataLoader(test_ds, batch_size=8, shuffle=False)
@@ -105,6 +129,7 @@ def main() -> None:
         probabilities, masks = segment(
             model, images, device, threshold, tta=not args.no_tta,
             min_component=cfg["postprocess"]["min_component"],
+            patch_size=patch_size, overlap=args.overlap,
         )
         all_images.append(images.numpy())
         all_targets.append(targets.numpy()[:, 0])

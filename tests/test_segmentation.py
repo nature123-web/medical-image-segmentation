@@ -289,6 +289,144 @@ def test_gradients_reach_the_encoder():
 
 
 # --------------------------------------------------------------------------- #
+# Sliding-window inference
+# --------------------------------------------------------------------------- #
+
+def test_gaussian_window_peaks_at_the_centre():
+    from src.inference import gaussian_weight_map
+
+    window = gaussian_weight_map((32, 32))
+    assert window.shape == (32, 32)
+    assert window.max() == pytest.approx(1.0)
+    centre = window[16, 16]
+    assert centre > window[0, 0] and centre > window[31, 31]
+
+
+def test_gaussian_window_never_reaches_zero():
+    """A zero-weight corner can be the only coverage of a border pixel.
+
+    If it were exactly zero the accumulated weight there would be zero and the
+    normalising division would produce NaN.
+    """
+    from src.inference import gaussian_weight_map
+
+    assert gaussian_weight_map((64, 64)).min() > 0
+
+
+def test_sliding_window_preserves_spatial_size():
+    from src.inference import sliding_window_inference
+
+    model = make_model().eval()
+    image = torch.randn(2, 1, 200, 170)
+    out = sliding_window_inference(image, model, patch_size=(64, 64))
+    assert out.shape == (2, 1, 200, 170)
+
+
+def test_sliding_window_reconstructs_an_identity_model_exactly():
+    """The blending must be an exact partition of unity.
+
+    With a model that returns its input, the accumulated, weight-normalised
+    output has to equal the input everywhere -- including in overlap regions and
+    at the borders. Any error here is a seam.
+    """
+    from src.inference import sliding_window_inference
+
+    image = torch.rand(1, 1, 150, 130)
+    out = sliding_window_inference(
+        image, lambda x: x, patch_size=(64, 64), overlap=0.5,
+        apply_sigmoid=False,
+    )
+    assert torch.allclose(out, image, atol=1e-5)
+
+
+def test_sliding_window_has_no_seams_on_a_constant_field():
+    from src.inference import sliding_window_inference
+
+    image = torch.full((1, 1, 180, 180), 0.7)
+    out = sliding_window_inference(
+        image, lambda x: x, patch_size=(64, 64), overlap=0.25,
+        apply_sigmoid=False,
+    )
+    # A seam would show up as local variation in an otherwise flat field.
+    assert out.std() < 1e-5
+
+
+@pytest.mark.parametrize("overlap", [0.0, 0.25, 0.5, 0.75])
+def test_sliding_window_covers_everything_at_any_overlap(overlap):
+    """Striding can leave an uncovered strip when the size is not divisible."""
+    from src.inference import sliding_window_inference
+
+    image = torch.rand(1, 1, 155, 97)
+    out = sliding_window_inference(
+        image, lambda x: x, patch_size=(64, 64), overlap=overlap,
+        apply_sigmoid=False,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, image, atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [(40, 30), (64, 12), (8, 8), (1, 64)])
+def test_sliding_window_handles_an_image_smaller_than_the_patch(size):
+    """Reflection padding cannot mirror further than the dimension it mirrors,
+    which is exactly the case here -- the fallback chain must cover it."""
+    from src.inference import sliding_window_inference
+
+    model = make_model().eval()
+    out = sliding_window_inference(torch.randn(1, 1, *size), model,
+                                   patch_size=(64, 64))
+    assert out.shape == (1, 1, *size)
+    assert torch.isfinite(out).all()
+
+
+def test_sliding_window_matches_direct_inference_on_a_single_patch():
+    torch.manual_seed(0)
+    from src.inference import sliding_window_inference
+
+    model = make_model().eval()
+    image = torch.randn(1, 1, 64, 64)
+    with torch.no_grad():
+        direct = torch.sigmoid(model(image))
+    windowed = sliding_window_inference(image, model, patch_size=(64, 64),
+                                        overlap=0.0)
+    assert torch.allclose(direct, windowed, atol=1e-5)
+
+
+def test_sliding_window_output_is_probabilities():
+    from src.inference import sliding_window_inference
+
+    model = make_model().eval()
+    out = sliding_window_inference(torch.randn(1, 1, 128, 128), model,
+                                   patch_size=(64, 64))
+    assert (out >= 0).all() and (out <= 1).all()
+
+
+def test_sliding_window_rejects_invalid_overlap():
+    from src.inference import sliding_window_inference
+
+    with pytest.raises(ValueError, match="overlap must be"):
+        sliding_window_inference(torch.rand(1, 1, 64, 64), lambda x: x,
+                                 patch_size=(32, 32), overlap=1.0)
+
+
+def test_sliding_window_accepts_deep_supervision_output():
+    from src.inference import sliding_window_inference
+
+    model = make_model(depth=3, deep_supervision=True).train()
+    out = sliding_window_inference(torch.randn(1, 1, 96, 96), model,
+                                   patch_size=(64, 64))
+    assert out.shape == (1, 1, 96, 96)
+
+
+def test_patch_memory_estimate_grows_with_patch_size():
+    from src.inference import estimate_patch_memory
+
+    small = estimate_patch_memory((128, 128), 32, 4)
+    large = estimate_patch_memory((256, 256), 32, 4)
+    assert large > small
+    assert small > 0
+
+
+# --------------------------------------------------------------------------- #
 # Losses
 # --------------------------------------------------------------------------- #
 
