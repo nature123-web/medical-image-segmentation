@@ -24,6 +24,10 @@ model:
   norm: instance                # instance | batch | group | none
   bilinear: true                # avoids transposed-conv checkerboarding
   deep_supervision: false
+  # Attention gates suppress background in the skip connections before they
+  # reach the decoder. Aimed squarely at the class-imbalance problem: when the
+  # foreground is under 1% of the image, most of what the skip carries is noise.
+  attention: false
 
 loss:
   dice_weight: 1.0

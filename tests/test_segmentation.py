@@ -179,6 +179,71 @@ def test_deep_supervision_returns_multiple_outputs_only_in_training():
         assert not isinstance(model(torch.randn(1, 1, 64, 64)), list)
 
 
+def test_attention_unet_forward_shape():
+    model = make_model(attention=True).eval()
+    with torch.no_grad():
+        assert model(torch.randn(2, 1, 64, 64)).shape == (2, 1, 64, 64)
+
+
+def test_attention_maps_are_probabilities_at_skip_resolution():
+    model = make_model(depth=3, attention=True).eval()
+    with torch.no_grad():
+        _, maps = model(torch.randn(1, 1, 64, 64), return_attention=True)
+
+    assert len(maps) == 3
+    for attention in maps:
+        assert attention.shape[1] == 1              # one gate per position
+        assert (attention >= 0).all() and (attention <= 1).all()
+    # Coarsest gate first, doubling resolution toward the output.
+    assert maps[0].shape[-1] * 4 == maps[-1].shape[-1]
+
+
+def test_attention_gate_suppresses_the_skip():
+    """The gate must actually scale the skip, not pass it through."""
+    from src.model import AttentionGate
+
+    torch.manual_seed(0)
+    gate = AttentionGate(gate_channels=8, skip_channels=8).eval()
+    skip = torch.randn(2, 8, 16, 16)
+    with torch.no_grad():
+        gated, attention = gate(torch.randn(2, 8, 16, 16), skip)
+
+    assert gated.shape == skip.shape
+    # sigmoid output is strictly below 1, so the gated skip is strictly smaller.
+    assert gated.abs().sum() < skip.abs().sum()
+    assert torch.allclose(gated, skip * attention)
+
+
+def test_attention_gate_upsamples_a_coarser_gating_signal():
+    from src.model import AttentionGate
+
+    gate = AttentionGate(gate_channels=8, skip_channels=8).eval()
+    with torch.no_grad():
+        gated, attention = gate(torch.randn(1, 8, 8, 8), torch.randn(1, 8, 16, 16))
+    assert gated.shape == (1, 8, 16, 16)
+    assert attention.shape == (1, 1, 16, 16)
+
+
+def test_attention_adds_parameters_and_is_off_by_default():
+    plain = make_model(attention=False)
+    gated = make_model(attention=True)
+    assert plain.gates is None
+    assert gated.gates is not None
+    assert sum(p.numel() for p in gated.parameters()) > \
+        sum(p.numel() for p in plain.parameters())
+
+
+def test_attention_model_trains():
+    model = make_model(attention=True)
+    target = torch.zeros(2, 1, 32, 32)
+    target[:, :, 8:16, 8:16] = 1.0
+    loss = CombinedLoss()(model(torch.randn(2, 1, 32, 32)), target)
+    loss.backward()
+    gate_grads = [p.grad for n, p in model.named_parameters()
+                  if n.startswith("gates") and p.grad is not None]
+    assert gate_grads and any(g.abs().sum() > 0 for g in gate_grads)
+
+
 def test_predict_returns_binary_mask():
     model = make_model().eval()
     mask = model.predict(torch.randn(2, 1, 32, 32))

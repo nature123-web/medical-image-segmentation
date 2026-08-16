@@ -59,6 +59,43 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 
+class AttentionGate(nn.Module):
+    """Additive attention gate on a skip connection (Oktay et al., 2018).
+
+    The plain U-Net concatenates the entire encoder feature map into the
+    decoder, background included. When the foreground is under 1% of the image
+    that is overwhelmingly irrelevant signal, and the decoder has to learn to
+    ignore it.
+
+    The gate instead computes a spatial attention map from the *coarser*
+    decoder features -- which already know roughly where the object is -- and
+    multiplies the skip by it before concatenation. Regions the decoder has no
+    interest in are suppressed at source.
+
+    ``g`` is the gating signal from the decoder, ``x`` the skip connection.
+    """
+
+    def __init__(self, gate_channels: int, skip_channels: int,
+                 inter_channels: int | None = None) -> None:
+        super().__init__()
+        inter_channels = inter_channels or max(1, skip_channels // 2)
+        self.theta = nn.Conv2d(skip_channels, inter_channels, 1, bias=False)
+        self.phi = nn.Conv2d(gate_channels, inter_channels, 1, bias=True)
+        self.psi = nn.Conv2d(inter_channels, 1, 1, bias=True)
+
+    def forward(self, gate: torch.Tensor, skip: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the gated skip and the attention map, for inspection."""
+        # The gating signal may be coarser than the skip; bring it up first.
+        if gate.shape[-2:] != skip.shape[-2:]:
+            gate = F.interpolate(gate, size=skip.shape[-2:], mode="bilinear",
+                                 align_corners=False)
+        attention = torch.sigmoid(
+            self.psi(F.relu(self.theta(skip) + self.phi(gate)))
+        )
+        return skip * attention, attention
+
+
 class UNet(nn.Module):
     """U-Net with a configurable depth and channel schedule."""
 
@@ -72,11 +109,13 @@ class UNet(nn.Module):
         norm: str = "instance",
         bilinear: bool = True,
         deep_supervision: bool = False,
+        attention: bool = False,
     ) -> None:
         super().__init__()
         self.depth = depth
         self.n_classes = n_classes
         self.deep_supervision = deep_supervision
+        self.attention = attention
 
         channels = [base_channels * (2 ** i) for i in range(depth + 1)]
 
@@ -89,7 +128,14 @@ class UNet(nn.Module):
 
         self.upsamples = nn.ModuleList()
         self.decoders = nn.ModuleList()
+        self.gates = nn.ModuleList() if attention else None
         for level in reversed(range(depth)):
+            if attention:
+                # Gating signal is the upsampled decoder feature, which has
+                # already been projected to channels[level].
+                self.gates.append(
+                    AttentionGate(channels[level], channels[level])
+                )
             if bilinear:
                 # Upsample + 1x1 conv: no checkerboard artefacts, fewer params.
                 self.upsamples.append(nn.Sequential(
@@ -113,7 +159,7 @@ class UNet(nn.Module):
                 for level in reversed(range(1, depth))
             ])
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
         """Logits at full resolution, or a list of them under deep supervision."""
         skips: List[torch.Tensor] = []
         for encoder in self.encoders:
@@ -123,6 +169,7 @@ class UNet(nn.Module):
         x = self.bottleneck(x)
 
         auxiliary: List[torch.Tensor] = []
+        attention_maps: List[torch.Tensor] = []
         for index, (upsample, decoder) in enumerate(
             zip(self.upsamples, self.decoders)
         ):
@@ -135,12 +182,19 @@ class UNet(nn.Module):
                 diff_x = skip.shape[-1] - x.shape[-1]
                 x = F.pad(x, [diff_x // 2, diff_x - diff_x // 2,
                               diff_y // 2, diff_y - diff_y // 2])
+
+            if self.gates is not None:
+                skip, attention = self.gates[index](x, skip)
+                attention_maps.append(attention)
+
             x = decoder(torch.cat([skip, x], dim=1))
             if (self.deep_supervision and self.training
                     and index < len(self.upsamples) - 1):
                 auxiliary.append(self.auxiliary_heads[index](x))
 
         logits = self.head(x)
+        if return_attention:
+            return logits, attention_maps
         if self.deep_supervision and self.training and auxiliary:
             return [logits] + auxiliary
         return logits
@@ -191,4 +245,5 @@ def build_model(cfg: dict) -> UNet:
         base_channels=m["base_channels"], depth=m["depth"],
         dropout=m["dropout"], norm=m["norm"], bilinear=m["bilinear"],
         deep_supervision=m["deep_supervision"],
+        attention=m.get("attention", False),
     )
