@@ -376,6 +376,91 @@ def test_focal_loss_downweights_easy_pixels():
     assert focal(easy, target) < focal(hard, target)
 
 
+def test_signed_distance_is_negative_inside_and_positive_outside():
+    from src.losses import signed_distance_map
+
+    mask = np.zeros((32, 32))
+    mask[10:20, 10:20] = 1
+    phi = signed_distance_map(mask, normalize=False)
+
+    assert phi[15, 15] < 0                 # deep inside
+    assert phi[0, 0] > 0                   # far outside
+    # The boundary pixel itself sits closest to zero.
+    assert abs(phi[10, 15]) < abs(phi[0, 0])
+
+
+def test_signed_distance_grows_with_distance():
+    from src.losses import signed_distance_map
+
+    mask = np.zeros((40, 40))
+    mask[18:22, 18:22] = 1
+    phi = signed_distance_map(mask, normalize=False)
+    assert phi[30, 20] > phi[24, 20] > 0
+
+
+def test_signed_distance_normalisation_is_size_independent():
+    """Same shape at two resolutions must give a comparable loss scale."""
+    from src.losses import signed_distance_map
+
+    small = np.zeros((64, 64)); small[16:48, 16:48] = 1
+    large = np.zeros((128, 128)); large[32:96, 32:96] = 1
+    assert abs(signed_distance_map(small).max()
+               - signed_distance_map(large).max()) < 0.05
+
+
+def test_signed_distance_handles_empty_and_full_masks():
+    from src.losses import signed_distance_map
+
+    empty = signed_distance_map(np.zeros((16, 16)))
+    full = signed_distance_map(np.ones((16, 16)))
+    assert np.isfinite(empty).all() and (empty > 0).all()
+    assert np.isfinite(full).all() and (full < 0).all()
+
+
+def test_boundary_loss_prefers_a_prediction_near_the_truth():
+    """The whole point: a distant false positive must cost more than a near one.
+
+    Dice scores these two identically -- same number of wrong pixels -- which
+    is exactly the blind spot this loss covers.
+    """
+    from src.losses import BoundaryLoss, DiceLoss
+
+    target = torch.zeros(1, 1, 64, 64)
+    target[:, :, 28:36, 28:36] = 1.0
+
+    near = torch.full((1, 1, 64, 64), -8.0)
+    near[:, :, 30:38, 30:38] = 8.0          # overlapping, slightly offset
+    far = torch.full((1, 1, 64, 64), -8.0)
+    far[:, :, 2:10, 2:10] = 8.0             # same size, opposite corner
+
+    boundary = BoundaryLoss()
+    assert boundary(near, target) < boundary(far, target)
+
+
+def test_boundary_loss_is_differentiable():
+    from src.losses import BoundaryLoss
+
+    logits = torch.randn(2, 1, 32, 32, requires_grad=True)
+    target = torch.zeros(2, 1, 32, 32)
+    target[:, :, 8:16, 8:16] = 1.0
+    loss = BoundaryLoss()(logits, target)
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad.abs().sum() > 0
+
+
+def test_boundary_weight_can_be_scheduled():
+    target = torch.zeros(1, 1, 32, 32)
+    target[:, :, 8:16, 8:16] = 1.0
+    logits = torch.randn(1, 1, 32, 32)
+
+    loss_fn = CombinedLoss(dice_weight=1.0, bce_weight=0.0, boundary_weight=0.0)
+    without = float(loss_fn(logits, target))
+    loss_fn.set_boundary_weight(1.0)
+    with_boundary = float(loss_fn(logits, target))
+    assert without != with_boundary
+
+
 def test_combined_loss_is_finite_and_differentiable():
     logits = torch.randn(2, 1, 16, 16, requires_grad=True)
     target = torch.zeros(2, 1, 16, 16)

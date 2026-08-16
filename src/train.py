@@ -150,8 +150,18 @@ def main() -> None:
         lambda s: cosine_with_warmup(s, cfg["train"]["warmup_steps"], total_steps),
     )
 
+    target_boundary_weight = cfg["loss"].get("boundary_weight", 0.0)
+    boundary_warmup = cfg["loss"].get("boundary_warmup_epochs", 0)
+
     history, best_dice, patience, best_state = [], -1.0, 0, None
     for epoch in range(1, cfg["train"]["epochs"] + 1):
+        # Ramp the boundary term in. Applied at full strength from step 0 it
+        # dominates while the prediction is still far from the truth, and
+        # training destabilises before Dice has found the lesion at all.
+        if target_boundary_weight and boundary_warmup:
+            ramp = min(1.0, (epoch - 1) / max(1, boundary_warmup))
+            criterion.set_boundary_weight(target_boundary_weight * ramp)
+
         model.train()
         total, seen = 0.0, 0
         for images, masks in tqdm(loaders["train"], desc=f"epoch {epoch}",

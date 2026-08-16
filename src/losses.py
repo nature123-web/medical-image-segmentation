@@ -8,9 +8,82 @@ address some part of that failure.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def signed_distance_map(mask: np.ndarray, normalize: bool = True) -> np.ndarray:
+    """Signed distance to the mask boundary: negative inside, positive outside.
+
+    Uses an exact Euclidean transform. An approximate chamfer version would be
+    cheaper but this runs once per sample per step, and a distance map that is
+    systematically wrong near the boundary defeats the point of the loss.
+
+    Distances are normalised by the image diagonal so the loss scale does not
+    depend on image size -- otherwise the same ``boundary_weight`` means
+    something different at 128x128 and 512x512.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    mask = mask.astype(bool)
+    if not mask.any():
+        # No foreground: every pixel is outside, so any predicted foreground is
+        # penalised by its distance to... nothing. Use a flat positive field so
+        # the loss stays finite and still discourages false positives.
+        phi = np.ones_like(mask, dtype=np.float32)
+    elif mask.all():
+        phi = -np.ones_like(mask, dtype=np.float32)
+    else:
+        outside = distance_transform_edt(~mask)
+        inside = distance_transform_edt(mask)
+        phi = (outside - inside).astype(np.float32)
+
+    if normalize:
+        diagonal = float(np.hypot(*mask.shape))
+        phi = phi / max(diagonal, 1.0)
+    return phi
+
+
+def batch_signed_distance(targets: torch.Tensor, normalize: bool = True
+                          ) -> torch.Tensor:
+    """Signed distance maps for a (B, 1, H, W) target batch."""
+    arrays = targets.detach().cpu().numpy()
+    maps = np.stack([
+        np.stack([signed_distance_map(channel, normalize) for channel in sample])
+        for sample in arrays
+    ])
+    return torch.from_numpy(maps).to(targets.device)
+
+
+class BoundaryLoss(nn.Module):
+    """Distance-weighted surface loss (Kervadec et al., 2019).
+
+    Dice and cross-entropy are *regional*: they count pixels and are blind to
+    how far a wrong pixel is from the truth. A false positive touching the
+    lesion and one on the other side of the image cost exactly the same, even
+    though only the second is clinically alarming -- and that is precisely the
+    gap HD95 measures and Dice does not.
+
+    This loss integrates the prediction against the ground truth's signed
+    distance field, so error is weighted by distance. It is designed to be used
+    *alongside* Dice, not instead of it: alone it has no notion of overlap and
+    the empty prediction is a valid minimiser.
+    """
+
+    def __init__(self, normalize: bool = True) -> None:
+        super().__init__()
+        self.normalize = normalize
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor
+                ) -> torch.Tensor:
+        probabilities = torch.sigmoid(logits)
+        # The distance field depends only on the target, so it carries no
+        # gradient -- computing it under no_grad keeps that explicit.
+        with torch.no_grad():
+            phi = batch_signed_distance(targets, self.normalize)
+        return (probabilities * phi).mean()
 
 
 def dice_coefficient(probabilities: torch.Tensor, targets: torch.Tensor,
@@ -112,6 +185,7 @@ class CombinedLoss(nn.Module):
 
     def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0,
                  focal_weight: float = 0.0, tversky_weight: float = 0.0,
+                 boundary_weight: float = 0.0,
                  pos_weight: float | None = None,
                  tversky_alpha: float = 0.3, tversky_beta: float = 0.7) -> None:
         super().__init__()
@@ -119,10 +193,12 @@ class CombinedLoss(nn.Module):
         self.bce_weight = bce_weight
         self.focal_weight = focal_weight
         self.tversky_weight = tversky_weight
+        self.boundary_weight = boundary_weight
 
         self.dice = DiceLoss()
         self.focal = FocalLoss()
         self.tversky = TverskyLoss(tversky_alpha, tversky_beta)
+        self.boundary = BoundaryLoss()
         self.register_buffer(
             "pos_weight",
             torch.tensor(pos_weight) if pos_weight is not None else None,
@@ -154,7 +230,19 @@ class CombinedLoss(nn.Module):
             total = total + self.focal_weight * self.focal(logits, targets)
         if self.tversky_weight:
             total = total + self.tversky_weight * self.tversky(logits, targets)
+        if self.boundary_weight:
+            total = total + self.boundary_weight * self.boundary(logits, targets)
         return total
+
+    def set_boundary_weight(self, weight: float) -> None:
+        """Adjust the boundary term during training.
+
+        Kervadec et al. recommend ramping this up rather than fixing it: early
+        on the prediction is far from the truth and the distance term dominates,
+        which destabilises training. ``train.py`` schedules it from 0 to
+        ``loss.boundary_weight`` over the run.
+        """
+        self.boundary_weight = float(weight)
 
 
 def build_loss(cfg: dict) -> CombinedLoss:
@@ -164,6 +252,7 @@ def build_loss(cfg: dict) -> CombinedLoss:
         bce_weight=loss_cfg["bce_weight"],
         focal_weight=loss_cfg["focal_weight"],
         tversky_weight=loss_cfg["tversky_weight"],
+        boundary_weight=loss_cfg.get("boundary_weight", 0.0),
         pos_weight=loss_cfg["pos_weight"],
         tversky_alpha=loss_cfg["tversky_alpha"],
         tversky_beta=loss_cfg["tversky_beta"],

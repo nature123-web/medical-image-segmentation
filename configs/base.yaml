@@ -37,6 +37,11 @@ loss:
   tversky_alpha: 0.3            # false-positive weight
   tversky_beta: 0.7             # false-negative weight; raise to buy recall
   pos_weight: null
+  # Distance-weighted surface loss. Dice is blind to how *far* a wrong pixel is
+  # from the truth, which is exactly what HD95 measures. Use alongside Dice,
+  # never alone -- on its own the empty prediction is a valid minimiser.
+  boundary_weight: 0.0
+  boundary_warmup_epochs: 10    # ramp in; full strength from step 0 destabilises
 
 postprocess:
   min_component: 20             # drop connected components below this size
