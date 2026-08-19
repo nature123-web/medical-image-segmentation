@@ -19,6 +19,8 @@ pip install -r requirements.txt
 python -m src.train --config configs/base.yaml
 python -m src.train --config configs/base.yaml --loss bce_only   # watch it fail
 python -m src.predict --checkpoint runs/base/best.pt --plot overlay.png
+
+pytest    # 101 tests
 ```
 
 The run prints this before training starts, so the baseline is never in doubt:
