@@ -21,7 +21,7 @@ tells you which cases are worth labelling and which are simply hard.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import torch
@@ -162,3 +162,105 @@ def uncertainty_error_correlation(uncertainties: np.ndarray,
     if len(uncertainties) < 3 or np.std(uncertainties) < 1e-12:
         return float("nan")
     return float(-stats.spearmanr(uncertainties, dice_scores).statistic)
+
+
+def uncertainty_report(
+    model: nn.Module,
+    loader: Iterable[Tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    n_samples: int = 20,
+    boundary_band_px: float = 5.0,
+    review_budget: float = 0.1,
+) -> Dict[str, object]:
+    """MC-dropout uncertainty, split by distance from the true lesion boundary.
+
+    This is the actual end-to-end computation behind the numbers the README
+    reports (boundary-band vs. far-background uncertainty, the
+    uncertainty-vs-error correlation, and a review-budget flag list) --
+    previously those numbers had no runnable path producing them; every
+    piece existed in this module but nothing called them together over a
+    dataset.
+
+    The split reuses the ground-truth signed distance field: pixels within
+    ``boundary_band_px`` of the true lesion boundary are "boundary band";
+    pixels more than that far outside any lesion are "far background". If the
+    decomposition is doing what it claims, epistemic uncertainty should
+    localise to the boundary band far more sharply than total uncertainty,
+    since aleatoric (image noise) is spread everywhere.
+    """
+    from .losses import signed_distance_map
+    from .metrics import dice_score
+
+    sums = {f"{kind}_{region}": 0.0
+            for kind in ("total", "epistemic", "aleatoric")
+            for region in ("boundary", "far")}
+    pixel_counts = {"boundary": 0, "far": 0}
+    case_uncertainties: list[float] = []
+    case_dices: list[float] = []
+
+    for images, targets in loader:
+        out = mc_dropout_predict(model, images.to(device), n_samples=n_samples)
+        mean = out["mean"].cpu().numpy()[:, 0]
+        total = out["total"].cpu().numpy()[:, 0]
+        aleatoric = out["aleatoric"].cpu().numpy()[:, 0]
+        epistemic_np = out["epistemic"].cpu().numpy()[:, 0]
+        target_np = targets.numpy()[:, 0]
+        masks = (mean >= 0.5).astype(np.float32)
+
+        for i in range(len(target_np)):
+            phi = signed_distance_map(target_np[i].astype(bool), normalize=False)
+            boundary = np.abs(phi) <= boundary_band_px
+            far = phi > boundary_band_px
+
+            for kind, arr in (("total", total[i]), ("epistemic", epistemic_np[i]),
+                              ("aleatoric", aleatoric[i])):
+                if boundary.any():
+                    sums[f"{kind}_boundary"] += float(arr[boundary].sum())
+                if far.any():
+                    sums[f"{kind}_far"] += float(arr[far].sum())
+            pixel_counts["boundary"] += int(boundary.sum())
+            pixel_counts["far"] += int(far.sum())
+
+            case_uncertainties.append(case_uncertainty(
+                torch.from_numpy(epistemic_np[i]), torch.from_numpy(masks[i])
+            ))
+            case_dices.append(dice_score(masks[i], target_np[i]))
+
+    means = {
+        key: (value / pixel_counts["boundary" if key.endswith("boundary") else "far"]
+              if pixel_counts["boundary" if key.endswith("boundary") else "far"]
+              else float("nan"))
+        for key, value in sums.items()
+    }
+    case_uncertainties_arr = np.array(case_uncertainties)
+    case_dices_arr = np.array(case_dices)
+    return {
+        **means,
+        "correlation": uncertainty_error_correlation(
+            case_uncertainties_arr, case_dices_arr
+        ),
+        "flagged_indices": rank_cases_for_review(
+            case_uncertainties_arr, budget=review_budget
+        ),
+        "n_cases": len(case_dices_arr),
+    }
+
+
+def format_uncertainty_report(report: Dict[str, object]) -> str:
+    def ratio(kind: str) -> float:
+        far = report[f"{kind}_far"]
+        return report[f"{kind}_boundary"] / far if far else float("nan")
+
+    lines = [f"{'':<12}{'boundary band':>15}{'far background':>17}{'ratio':>9}"]
+    for kind in ("total", "epistemic", "aleatoric"):
+        lines.append(
+            f"{kind:<12}{report[f'{kind}_boundary']:>15.4f}"
+            f"{report[f'{kind}_far']:>17.4f}{ratio(kind):>8.1f}x"
+        )
+    lines.append("")
+    lines.append(f"uncertainty-vs-error correlation: {report['correlation']:.3f}")
+    lines.append(
+        f"flagged {len(report['flagged_indices'])}/{report['n_cases']} "
+        "cases for review"
+    )
+    return "\n".join(lines)

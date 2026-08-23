@@ -20,7 +20,7 @@ python -m src.train --config configs/base.yaml
 python -m src.train --config configs/base.yaml --loss bce_only   # watch it fail
 python -m src.predict --checkpoint runs/base/best.pt --plot overlay.png
 
-pytest    # 101 tests
+pytest    # 111 tests
 ```
 
 The run prints this before training starts, so the baseline is never in doubt:
@@ -176,6 +176,18 @@ out["epistemic"]   # where the model is out of its depth
 review = rank_cases_for_review(case_uncertainties, budget=0.1)
 ```
 
+The table above is produced end-to-end by `src.predict --uncertainty`, which
+runs MC dropout over the test set, splits every pixel into "boundary band" or
+"far background" by its ground-truth signed distance (`--boundary-band-px`,
+default 5px), and reports the correlation and a review-budget flag list
+alongside it:
+
+```bash
+python -m src.train --config configs/base.yaml --dropout 0.3   # dropout=0 in base.yaml by default
+python -m src.predict --checkpoint runs/base/best.pt \
+    --uncertainty --mc-samples 20 --review-budget 0.1
+```
+
 One implementation detail worth stating, because it is the standard mistake:
 `enable_dropout` activates **only** the dropout layers. Calling `model.train()`
 would also reactivate BatchNorm's batch statistics, so predictions would depend
@@ -287,7 +299,7 @@ src/
   uncertainty.py  MC dropout, aleatoric/epistemic split, review ranking
   train.py        training loop, threshold tuning, post-processing comparison
   predict.py      inference and overlay rendering
-tests/            pytest suite (101 tests)
+tests/            pytest suite (111 tests)
 ```
 
 ## License

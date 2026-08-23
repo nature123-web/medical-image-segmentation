@@ -93,6 +93,32 @@ def tune_threshold(model, loader, device, candidates=None):
     return best_threshold, best_dice
 
 
+LOSS_PRESETS = {
+    "combined": dict(dice_weight=1.0, bce_weight=1.0, tversky_weight=0.0),
+    "dice_only": dict(dice_weight=1.0, bce_weight=0.0, tversky_weight=0.0),
+    "bce_only": dict(dice_weight=0.0, bce_weight=1.0, tversky_weight=0.0),
+    "tversky": dict(dice_weight=0.0, bce_weight=0.5, tversky_weight=1.0),
+}
+
+
+def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
+    """Apply --epochs/--out-dir/--dropout/--loss onto a loaded config, in place.
+
+    Split out from main() so the override logic -- which flag maps to which
+    config key, and which loss preset is which weight combination -- can be
+    checked directly instead of only ever running inside a full training job.
+    """
+    if args.epochs:
+        cfg["train"]["epochs"] = args.epochs
+    if args.out_dir:
+        cfg["out_dir"] = args.out_dir
+    if args.dropout is not None:
+        cfg["model"]["dropout"] = args.dropout
+    if args.loss:
+        cfg["loss"].update(LOSS_PRESETS[args.loss])
+    return cfg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/base.yaml")
@@ -100,21 +126,14 @@ def main() -> None:
     parser.add_argument("--loss", default=None,
                         choices=["combined", "dice_only", "bce_only", "tversky"])
     parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Overrides model.dropout. Needs to be > 0 for "
+                             "src.predict --uncertainty to produce a "
+                             "non-degenerate MC-dropout estimate.")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8-sig"))
-    if args.epochs:
-        cfg["train"]["epochs"] = args.epochs
-    if args.out_dir:
-        cfg["out_dir"] = args.out_dir
-    if args.loss:
-        presets = {
-            "combined": dict(dice_weight=1.0, bce_weight=1.0, tversky_weight=0.0),
-            "dice_only": dict(dice_weight=1.0, bce_weight=0.0, tversky_weight=0.0),
-            "bce_only": dict(dice_weight=0.0, bce_weight=1.0, tversky_weight=0.0),
-            "tversky": dict(dice_weight=0.0, bce_weight=0.5, tversky_weight=1.0),
-        }
-        cfg["loss"].update(presets[args.loss])
+    apply_cli_overrides(cfg, args)
 
     set_seed(cfg["seed"])
     device = resolve_device(cfg["train"]["device"])

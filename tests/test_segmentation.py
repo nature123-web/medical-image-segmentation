@@ -582,6 +582,73 @@ def test_uncertainty_error_correlation_is_positive_when_useful():
     assert np.isnan(uncertainty_error_correlation(unrelated, dice))
 
 
+def test_uncertainty_report_end_to_end():
+    """This is the computation behind the README's boundary/far-background
+    table -- previously every piece it needs existed in this module, but
+    nothing actually ran them together over a dataset. Checks the report is
+    internally consistent, not just that it runs.
+    """
+    from src.uncertainty import uncertainty_report
+
+    torch.manual_seed(0)
+    dataset = SegmentationDataset(6, size=32, seed=0, lesion_probability=1.0)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=2, shuffle=False)
+    model = make_model(dropout=0.3, base_channels=8, depth=2).eval()
+
+    report = uncertainty_report(model, loader, torch.device("cpu"),
+                                n_samples=6, boundary_band_px=3.0,
+                                review_budget=0.5)
+
+    for kind in ("total", "epistemic", "aleatoric"):
+        for region in ("boundary", "far"):
+            value = report[f"{kind}_{region}"]
+            assert value == value, f"{kind}_{region} was nan"
+            assert value >= 0.0
+
+    # total = aleatoric + epistemic pointwise, and boundary/far both average
+    # over the same pixels for every kind, so the identity survives the mean.
+    for region in ("boundary", "far"):
+        assert report[f"total_{region}"] == pytest.approx(
+            report[f"epistemic_{region}"] + report[f"aleatoric_{region}"],
+            abs=1e-4,
+        )
+
+    assert report["n_cases"] == 6
+    assert 1 <= len(report["flagged_indices"]) <= 6
+    correlation = report["correlation"]
+    assert np.isnan(correlation) or -1.0 <= correlation <= 1.0
+
+
+def test_uncertainty_report_flags_the_requested_fraction():
+    from src.uncertainty import uncertainty_report
+
+    torch.manual_seed(1)
+    dataset = SegmentationDataset(10, size=32, seed=1, lesion_probability=1.0)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=5, shuffle=False)
+    model = make_model(dropout=0.3, base_channels=8, depth=2).eval()
+
+    report = uncertainty_report(model, loader, torch.device("cpu"),
+                                n_samples=5, review_budget=0.2)
+    assert len(report["flagged_indices"]) == 2                # 20% of 10
+
+
+def test_format_uncertainty_report_renders_all_three_kinds():
+    from src.uncertainty import format_uncertainty_report
+
+    report = {
+        "total_boundary": 0.31, "total_far": 0.17,
+        "epistemic_boundary": 0.03, "epistemic_far": 0.002,
+        "aleatoric_boundary": 0.28, "aleatoric_far": 0.16,
+        "correlation": 0.79, "flagged_indices": np.array([2, 5]),
+        "n_cases": 20,
+    }
+    text = format_uncertainty_report(report)
+    for token in ("total", "epistemic", "aleatoric", "boundary band",
+                 "far background", "ratio", "correlation: 0.790",
+                 "flagged 2/20"):
+        assert token in text
+
+
 # --------------------------------------------------------------------------- #
 # Losses
 # --------------------------------------------------------------------------- #
@@ -912,3 +979,73 @@ def test_remove_small_components_treats_diagonal_as_separate():
     mask[2, 2] = 1
     mask[3, 3] = 1
     assert remove_small_components(mask, min_size=2).sum() == 0
+
+
+# --------------------------------------------------------------------------- #
+# Training CLI overrides
+# --------------------------------------------------------------------------- #
+
+def _train_args(**kwargs):
+    from argparse import Namespace
+    defaults = dict(epochs=None, out_dir=None, dropout=None, loss=None)
+    defaults.update(kwargs)
+    return Namespace(**defaults)
+
+
+def _base_cfg():
+    return {
+        "train": {"epochs": 40},
+        "out_dir": "runs/base",
+        "model": {"dropout": 0.0},
+        "loss": {"dice_weight": 1.0, "bce_weight": 1.0, "tversky_weight": 0.0},
+    }
+
+
+def test_dropout_override_reaches_the_model_config():
+    """--dropout is what makes src.predict --uncertainty non-degenerate --
+    if this doesn't actually land in cfg['model']['dropout'], MC dropout
+    silently has nothing to sample from.
+    """
+    from src.train import apply_cli_overrides
+
+    cfg = apply_cli_overrides(_base_cfg(), _train_args(dropout=0.3))
+    assert cfg["model"]["dropout"] == 0.3
+
+
+def test_dropout_override_of_zero_is_respected():
+    """0.0 is falsy, so a naive `if args.dropout:` would silently drop this --
+    the override must be gated on `is not None`.
+    """
+    from src.train import apply_cli_overrides
+
+    cfg = apply_cli_overrides(_base_cfg(), _train_args(dropout=0.0))
+    assert cfg["model"]["dropout"] == 0.0
+
+
+def test_no_dropout_flag_leaves_config_dropout_unchanged():
+    from src.train import apply_cli_overrides
+
+    cfg = apply_cli_overrides(_base_cfg(), _train_args())
+    assert cfg["model"]["dropout"] == 0.0
+
+
+def test_epochs_and_out_dir_overrides():
+    from src.train import apply_cli_overrides
+
+    cfg = apply_cli_overrides(_base_cfg(),
+                              _train_args(epochs=5, out_dir="runs/custom"))
+    assert cfg["train"]["epochs"] == 5
+    assert cfg["out_dir"] == "runs/custom"
+
+
+@pytest.mark.parametrize("preset,expected", [
+    ("dice_only", dict(dice_weight=1.0, bce_weight=0.0, tversky_weight=0.0)),
+    ("bce_only", dict(dice_weight=0.0, bce_weight=1.0, tversky_weight=0.0)),
+    ("tversky", dict(dice_weight=0.0, bce_weight=0.5, tversky_weight=1.0)),
+])
+def test_loss_preset_overrides_set_the_documented_weights(preset, expected):
+    from src.train import apply_cli_overrides
+
+    cfg = apply_cli_overrides(_base_cfg(), _train_args(loss=preset))
+    for key, value in expected.items():
+        assert cfg["loss"][key] == value

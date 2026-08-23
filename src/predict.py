@@ -109,6 +109,12 @@ def main() -> None:
                              "size. Required for images larger than the "
                              "training crop.")
     parser.add_argument("--overlap", type=float, default=0.5)
+    parser.add_argument("--uncertainty", action="store_true",
+                        help="Report MC-dropout uncertainty (requires the "
+                             "checkpoint's model.dropout > 0).")
+    parser.add_argument("--mc-samples", type=int, default=20)
+    parser.add_argument("--boundary-band-px", type=float, default=5.0)
+    parser.add_argument("--review-budget", type=float, default=0.1)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
@@ -144,6 +150,19 @@ def main() -> None:
     print("\n" + format_report(
         aggregate(evaluate_batch(masks, targets)), "U-Net"
     ))
+
+    if args.uncertainty:
+        from .uncertainty import format_uncertainty_report, uncertainty_report
+
+        uncertainty_loader = torch.utils.data.DataLoader(
+            test_ds, batch_size=4, shuffle=False
+        )
+        report = uncertainty_report(
+            model, uncertainty_loader, device, n_samples=args.mc_samples,
+            boundary_band_px=args.boundary_band_px,
+            review_budget=args.review_budget,
+        )
+        print("\n" + format_uncertainty_report(report))
 
     if args.plot:
         # Show the hardest cases, not the easiest -- a montage of successes
