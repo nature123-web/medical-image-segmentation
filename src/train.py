@@ -70,7 +70,11 @@ def tune_threshold(model, loader, device, candidates=None):
     the best operating point is usually well below 0.5 -- worth several Dice
     points for free.
     """
-    candidates = candidates or np.arange(0.1, 0.91, 0.05)
+    # Not `candidates or np.arange(...)`: bool() of a numpy array with more
+    # than one element raises ValueError, which meant passing any real
+    # custom candidate array -- the entire reason this parameter exists --
+    # crashed here instead of the None default.
+    candidates = np.arange(0.1, 0.91, 0.05) if candidates is None else candidates
     probabilities, targets = [], []
     with torch.no_grad():
         model.eval()

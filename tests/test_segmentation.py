@@ -1049,3 +1049,23 @@ def test_loss_preset_overrides_set_the_documented_weights(preset, expected):
     cfg = apply_cli_overrides(_base_cfg(), _train_args(loss=preset))
     for key, value in expected.items():
         assert cfg["loss"][key] == value
+
+
+def test_tune_threshold_accepts_a_custom_candidate_array():
+    """`candidates or np.arange(...)` used to raise ValueError for any real
+    array of more than one candidate, because bool() of a multi-element
+    numpy array is ambiguous -- so the parameter only ever worked with its
+    own None default, never with an actual caller-supplied array.
+    """
+    from src.train import tune_threshold
+
+    torch.manual_seed(0)
+    dataset = SegmentationDataset(4, size=32, seed=0, lesion_probability=1.0)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=2, shuffle=False)
+    model = make_model(base_channels=8, depth=2).eval()
+
+    candidates = np.array([0.2, 0.4, 0.6, 0.8])
+    threshold, dice = tune_threshold(model, loader, torch.device("cpu"),
+                                     candidates=candidates)
+    assert threshold in candidates
+    assert 0.0 <= dice <= 1.0
